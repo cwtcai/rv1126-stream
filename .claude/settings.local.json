@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(\"D:/ffmpeg/bin/ffmpeg.exe\" -version)",
+      "Bash(timeout 3 bash -c \"echo >/dev/tcp/192.168.137.9/8080\")"
+    ]
+  }
+}
