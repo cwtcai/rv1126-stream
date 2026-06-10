@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RV1126 物联网摄像头实时监控</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+  *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: #0f0f1a;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 20px;
+  }
+  header { text-align:center; margin-bottom:16px; }
+  header h1 { font-size:1.3rem; font-weight:600; color:#5ec4ff; }
+  header .sub { font-size:0.78rem; color:#666; margin-top:4px; }
+
+  #player-wrapper {
+    width:100%; max-width:880px;
+    background:#000; border-radius:10px 10px 0 0; overflow:hidden;
+    box-shadow: 0 0 40px rgba(94,196,255,0.06);
+  }
+  video { width:100%; display:block; aspect-ratio:4/3; object-fit:contain; background:#000; }
+
+  /* status bar */
+  #status-bar {
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:10px 16px; font-size:0.8rem;
+    background:#111122; border-bottom:1px solid #1a1a2e;
+  }
+  #status-left { display:flex; align-items:center; gap:8px; }
+  #status-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+  .status-loading #status-dot { background:#f0a030; box-shadow:0 0 6px #f0a030; }
+  .status-playing  #status-dot { background:#30d070; box-shadow:0 0 6px #30d070; }
+  .status-error   #status-dot { background:#e04040; box-shadow:0 0 6px #e04040; }
+  #unmute-btn {
+    background:#2a2a40; color:#ccc; border:1px solid #3a3a50;
+    padding:4px 12px; border-radius:4px; cursor:pointer; font-size:0.75rem;
+  }
+  #unmute-btn:hover { background:#3a3a50; color:#fff; }
+  #unmute-btn.unmuted { background:#1a3a1a; border-color:#2a5a2a; color:#30d070; }
+
+  /* talk button */
+  #talk-section {
+    width:100%; max-width:880px; margin-top:12px; margin-bottom:4px;
+    display:flex; align-items:center; gap:10px; justify-content:center;
+  }
+  #talk-btn {
+    width:100%; max-width:300px; height:48px;
+    background:#1a1a30; color:#aaa; border:2px solid #2a2a40;
+    border-radius:24px; cursor:pointer; font-size:0.9rem; font-family:inherit;
+    transition: all 0.15s; user-select:none; -webkit-user-select:none;
+  }
+  #talk-btn:hover { border-color:#4a4a60; color:#ccc; }
+  #talk-btn.active {
+    background:#30d070; color:#000; border-color:#30d070;
+    box-shadow: 0 0 20px rgba(48,208,112,0.4);
+    font-weight:600;
+  }
+  #talk-status {
+    font-size:0.75rem; color:#555; min-width:80px; text-align:center;
+  }
+
+  /* audio viz */
+  #viz-wrapper {
+    width:100%; max-width:880px;
+    background:#0a0a16; border-radius:0 0 10px 10px;
+    padding:8px 16px 12px;
+    box-shadow: 0 4px 20px rgba(94,196,255,0.04);
+    margin-bottom:16px;
+  }
+  #viz-label {
+    font-size:0.7rem; color:#555; margin-bottom:4px;
+    display:flex; align-items:center; gap:6px;
+  }
+  #viz-label .active-dot {
+    width:6px; height:6px; border-radius:50%; background:#30d070;
+    display:none;
+  }
+  #viz-label .active-dot.on { display:block; }
+  canvas { width:100%; height:48px; display:block; }
+
+  .info-row { font-size:0.75rem; color:#555; text-align:center; }
+  .info-row code { background:#1a1a2e; padding:2px 6px; border-radius:4px; color:#777; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>RV1126 物联网摄像头实时监控</h1>
+  <p class="sub">HLS 直播 &middot; H.264 + AAC &middot; 四通道麦克风阵列</p>
+</header>
+
+<div id="player-wrapper">
+  <video id="video" autoplay muted playsinline></video>
+</div>
+
+<div id="status-bar" class="status-loading">
+  <div id="status-left">
+    <span id="status-dot"></span>
+    <span id="status-text">正在连接直播流...</span>
+  </div>
+  <button id="unmute-btn" onclick="toggleMute()">🔇 已静音，点击开声音</button>
+</div>
+
+<div id="viz-wrapper">
+  <div id="viz-label">
+    <span class="active-dot" id="audio-dot"></span>
+    音频波形
+  </div>
+  <canvas id="viz-canvas"></canvas>
+</div>
+
+<div id="talk-section">
+  <button id="talk-btn">按住说话（推流到板子扬声器）</button>
+</div>
+
+<div class="info-row">
+  <span>推流地址：<code>hls/stream.m3u8</code></span>
+  <span id="talk-status"></span>
+</div>
+
+<script>
+var audioCtx = null;
+var analyser = null;
+var animId = null;
+var muted = true;
+
+// ---- 开声音 ----
+function toggleMute() {
+  var v = document.getElementById('video');
+  var btn = document.getElementById('unmute-btn');
+  v.muted = !v.muted;
+  muted = v.muted;
+  btn.textContent = muted ? '🔇 已静音，点击开声音' : '🔊 有声';
+  btn.className = muted ? '' : 'unmuted';
+  // 唤醒 AudioContext（浏览器策略要求用户交互后才能播放音频）
+  if (!muted && audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().then(function() {
+      console.log('AudioContext resumed, state:', audioCtx.state);
+    });
+  }
+}
+
+// ---- 音频频谱 ----
+function setupAudioViz() {
+  var video = document.getElementById('video');
+  var canvas = document.getElementById('viz-canvas');
+  var dot = document.getElementById('audio-dot');
+  var ctx = canvas.getContext('2d');
+
+  function resize() {
+    canvas.width = canvas.clientWidth * devicePixelRatio;
+    canvas.height = canvas.clientHeight * devicePixelRatio;
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  if (!audioCtx) {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      var source = audioCtx.createMediaElementSource(video);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.7;
+      source.connect(analyser);
+      analyser.connect(audioCtx.destination);
+    } catch(e) { console.log('Web Audio API error:', e); return; }
+  }
+
+  var bufferLength = analyser.frequencyBinCount;
+  var dataArray = new Uint8Array(bufferLength);
+  var barCount = 48;
+
+  function draw() {
+    animId = requestAnimationFrame(draw);
+    analyser.getByteFrequencyData(dataArray);
+    var w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    var sum = 0;
+    for (var i = 0; i < bufferLength; i++) sum += dataArray[i];
+    dot.className = sum / bufferLength > 5 ? 'active-dot on' : 'active-dot';
+
+    var barW = (w / barCount) * 0.7, gap = (w / barCount) * 0.3;
+    var step = Math.floor(bufferLength / barCount);
+    for (var i = 0; i < barCount; i++) {
+      var val = dataArray[i * step] / 255;
+      var bh = val * h * 0.9;
+      var x = i * (barW + gap), y = h - bh;
+      ctx.fillStyle = 'rgb(' + Math.floor(val*40) + ',' + Math.floor(100+val*155) + ',' + Math.floor(200-val*100) + ')';
+      ctx.fillRect(x, y, barW, bh);
+    }
+  }
+  draw();
+}
+
+// ---- 按住说话 ----
+var ws = null;
+var micStream = null;
+var micCtx = null;
+var micProc = null;
+var talking = false;
+
+function connectWebSocket() {
+  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  var url = proto + '://' + location.hostname + ':8082';
+  try {
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function() { console.log('WebSocket connected'); };
+    ws.onclose = function() { console.log('WebSocket closed'); };
+    ws.onerror = function() { console.log('WebSocket error'); };
+  } catch(e) { console.log('WebSocket failed:', e); }
+}
+
+function startMic() {
+  if (micStream && micCtx) {
+    // Already have mic, just resume
+    micCtx.resume();
+    return Promise.resolve();
+  }
+  return navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } })
+    .then(function(stream) {
+      micStream = stream;
+      micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      var source = micCtx.createMediaStreamSource(stream);
+      // ScriptProcessorNode: 4096 samples per chunk at 16kHz = ~256ms
+      micProc = micCtx.createScriptProcessor(4096, 1, 1);
+      micProc.onaudioprocess = function(e) {
+        if (!talking || !ws || ws.readyState !== WebSocket.OPEN) return;
+        var input = e.inputBuffer.getChannelData(0);  // Float32Array
+        var buf = new Int16Array(input.length);
+        for (var i = 0; i < input.length; i++) {
+          var s = Math.max(-1, Math.min(1, input[i]));
+          buf[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        ws.send(buf.buffer);
+      };
+      source.connect(micProc);
+      micProc.connect(micCtx.destination);  // 不播放本地回声
+    });
+}
+
+function stopMic() {
+  if (micStream) {
+    micStream.getTracks().forEach(function(t) { t.stop(); });
+    micStream = null;
+  }
+  if (micCtx) {
+    micCtx.close();
+    micCtx = null;
+  }
+  micProc = null;
+}
+
+function startTalk() {
+  if (talking) return;
+  talking = true;
+  var btn = document.getElementById('talk-btn');
+  var st  = document.getElementById('talk-status');
+  btn.textContent = '正在说话...松开停止';
+  btn.className = 'active';
+  st.textContent = '🔴 对讲中';
+
+  // Ensure WebSocket
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connectWebSocket();
+  }
+  startMic().catch(function(e) {
+    st.textContent = '麦克风权限未授权';
+    stopTalk();
+  });
+}
+
+function stopTalk() {
+  if (!talking) return;
+  talking = false;
+  var btn = document.getElementById('talk-btn');
+  var st  = document.getElementById('talk-status');
+  btn.textContent = '按住说话（推流到板子扬声器）';
+  btn.className = '';
+  st.textContent = '';
+  stopMic();
+}
+
+(function() {
+  var talkBtn = document.getElementById('talk-btn');
+
+  talkBtn.addEventListener('mousedown', function(e) {
+    e.preventDefault(); startTalk();
+  });
+  talkBtn.addEventListener('mouseup', function(e) {
+    e.preventDefault(); stopTalk();
+  });
+  talkBtn.addEventListener('mouseleave', function(e) {
+    if (talking) stopTalk();
+  });
+
+  // Touch support for mobile
+  talkBtn.addEventListener('touchstart', function(e) {
+    e.preventDefault(); startTalk();
+  });
+  talkBtn.addEventListener('touchend', function(e) {
+    e.preventDefault(); stopTalk();
+  });
+  talkBtn.addEventListener('touchcancel', function(e) {
+    stopTalk();
+  });
+})();
+
+// ---- HLS 播放器 ----
+(function() {
+  var video    = document.getElementById('video');
+  var status   = document.getElementById('status-text');
+  var bar      = document.getElementById('status-bar');
+  var hlsUrl   = 'hls/stream.m3u8';
+
+  function setStatus(text, cls) {
+    status.textContent = text;
+    bar.className = cls;
+  }
+
+  function initHls() {
+    if (Hls.isSupported()) {
+      var hls = new Hls({
+        enableWorker: false,
+        lowLatencyMode: false,
+        maxBufferLength: 4,
+        maxMaxBufferLength: 8,
+        maxBufferSize: 4 * 1000 * 1000,
+        startFragPrefetch: false,
+        manifestLoadingTimeOut: 8000,
+        manifestLoadingMaxRetry: 6,
+        levelLoadingTimeOut: 8000,
+        fragLoadingTimeOut: 15000,
+      });
+
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        setStatus('直播中  |  H.264 + AAC  |  RV1126', 'status-playing');
+        video.play().then(function() { setupAudioViz(); })
+          .catch(function() { setStatus('请点击画面开始播放', 'status-loading'); });
+      });
+
+      hls.on(Hls.Events.ERROR, function(event, data) {
+        if (!data.fatal) return;
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            setStatus('网络错误，正在重连...', 'status-error');
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            setStatus('解码错误，正在恢复...', 'status-error');
+            hls.recoverMediaError();
+            break;
+          default:
+            setStatus('播放失败，请刷新页面', 'status-error');
+            hls.destroy();
+            break;
+        }
+      });
+
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = hlsUrl;
+      video.addEventListener('loadedmetadata', function() {
+        setStatus('直播中（原生 HLS） | Safari', 'status-playing');
+        setupAudioViz();
+      });
+      video.addEventListener('error', function() {
+        setStatus('串流错误，请刷新页面', 'status-error');
+      });
+    } else {
+      setStatus('您的浏览器不支持 HLS 播放', 'status-error');
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initHls);
+  } else {
+    initHls();
+  }
+})();
+</script>
+</body>
+</html>

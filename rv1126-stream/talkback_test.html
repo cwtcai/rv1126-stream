@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>对讲测试</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#0f0f1a; color:#e0e0e0;
+    font-family:"Microsoft YaHei",sans-serif;
+    display:flex; flex-direction:column; align-items:center;
+    justify-content:center; min-height:100vh; padding:20px;
+  }
+  h1 { font-size:1.2rem; color:#5ec4ff; margin-bottom:8px; }
+  .sub { font-size:0.8rem; color:#666; margin-bottom:32px; }
+
+  #talk-btn {
+    width:200px; height:200px; border-radius:50%;
+    background:#1a1a30; border:3px solid #2a2a40;
+    cursor:pointer; font-size:1rem; font-family:inherit; color:#aaa;
+    transition: all 0.15s; user-select:none; -webkit-user-select:none;
+    outline:none; margin-bottom:20px;
+  }
+  #talk-btn:hover { border-color:#4a4a60; color:#ccc; }
+  #talk-btn.active {
+    background:#30d070; color:#000; border-color:#30d070;
+    box-shadow:0 0 40px rgba(48,208,112,0.5); font-weight:700; font-size:1.1rem;
+  }
+
+  #meter-bar {
+    width:200px; height:6px; background:#1a1a2e; border-radius:3px;
+    overflow:hidden; margin-bottom:8px;
+  }
+  #meter-fill {
+    height:100%; width:0%; background:#30d070;
+    transition:width 0.08s; border-radius:3px;
+  }
+  #status { font-size:0.8rem; color:#555; text-align:center; margin-top:8px; }
+  #info { font-size:0.75rem; color:#444; text-align:center; margin-top:24px; }
+</style>
+</head>
+<body>
+
+<h1>浏览器对讲测试</h1>
+<p class="sub">按住按钮说话 → WebSocket → Python 中继 → 板子扬声器</p>
+
+<button id="talk-btn">按住说话</button>
+<div id="meter-bar"><div id="meter-fill"></div></div>
+<p id="status">准备好</p>
+<p id="info">WebSocket: ws://<span id="ws-addr">--</span>:8082</p>
+
+<script>
+var ws = null;
+var micStream = null, micCtx = null, micProc = null;
+var talking = false;
+var meterEl = document.getElementById('meter-fill');
+var statusEl = document.getElementById('status');
+var btn = document.getElementById('talk-btn');
+var wsAddr = document.getElementById('ws-addr');
+
+wsAddr.textContent = location.hostname;
+
+function setStatus(text, color) {
+  statusEl.textContent = text;
+  statusEl.style.color = color || '#555';
+}
+
+function connectWS() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  try {
+    ws = new WebSocket('ws://' + location.hostname + ':8082');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen  = function() { setStatus('WebSocket 已连接', '#30d070'); };
+    ws.onclose = function() { setStatus('WebSocket 断开', '#e04040'); };
+    ws.onerror = function() { setStatus('WebSocket 连接失败', '#e04040'); };
+  } catch(e) { setStatus('WebSocket 不可用', '#e04040'); }
+}
+
+function startMic() {
+  return navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } })
+    .then(function(stream) {
+      micStream = stream;
+      micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      var source = micCtx.createMediaStreamSource(stream);
+      micProc = micCtx.createScriptProcessor(2048, 1, 1);
+      micProc.onaudioprocess = function(e) {
+        if (!talking || !ws || ws.readyState !== WebSocket.OPEN) return;
+        var input = e.inputBuffer.getChannelData(0);
+        var buf = new Int16Array(input.length);
+        var peak = 0;
+        for (var i = 0; i < input.length; i++) {
+          var s = Math.max(-1, Math.min(1, input[i]));
+          if (Math.abs(s) > peak) peak = Math.abs(s);
+          buf[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        ws.send(buf.buffer);
+        meterEl.style.width = Math.min(100, peak * 100) + '%';
+      };
+      source.connect(micProc);
+      micProc.connect(micCtx.destination);
+      setStatus('麦克风已就绪', '#f0a030');
+    });
+}
+
+function stopMic() {
+  if (micStream) { micStream.getTracks().forEach(function(t) { t.stop(); }); micStream = null; }
+  if (micCtx)   { micCtx.close(); micCtx = null; }
+  micProc = null;
+  meterEl.style.width = '0%';
+}
+
+function startTalk() {
+  if (talking) return;
+  talking = true;
+  btn.textContent = '正在说话';
+  btn.className = 'active';
+  connectWS();
+  startMic().catch(function(e) {
+    setStatus('麦克风权限未授权，请允许后刷新', '#e04040');
+    stopTalk();
+  });
+}
+
+function stopTalk() {
+  if (!talking) return;
+  talking = false;
+  btn.textContent = '按住说话';
+  btn.className = '';
+  stopMic();
+  setStatus('准备好');
+}
+
+btn.addEventListener('mousedown',  function(e) { e.preventDefault(); startTalk(); });
+btn.addEventListener('mouseup',    function(e) { e.preventDefault(); stopTalk(); });
+btn.addEventListener('mouseleave', function(e) { if (talking) stopTalk(); });
+btn.addEventListener('touchstart', function(e) { e.preventDefault(); startTalk(); });
+btn.addEventListener('touchend',   function(e) { e.preventDefault(); stopTalk(); });
+btn.addEventListener('touchcancel',function(e) { stopTalk(); });
+</script>
+</body>
+</html>
